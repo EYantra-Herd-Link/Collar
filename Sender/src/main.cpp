@@ -10,6 +10,8 @@
 #include <driver/i2s.h>
 #include <esp_task_wdt.h>
 #include <esp_mac.h>
+#include <esp_pm.h>
+#include <esp_sleep.h>
 
 #define I2S_SCK         D0
 #define I2S_SD          D1
@@ -22,7 +24,7 @@
 #define PIN_MPU_INT     D10
 
 #define QUEUE_LENGTH                20
-#define SENSOR_POLL_RATE_MS         10000
+#define SENSOR_POLL_RATE_MS         45000
 #define IMU_SAMPLES_PER_CYCLE       10
 #define IMU_SAMPLE_INTERVAL_MS      100
 #define RUMINATION_PITCH_THRESHOLD  0.5f
@@ -217,21 +219,13 @@ void indicateBehavior(BehaviorState state) {
 
 void sensorTask(void *pvParameters) {
   esp_task_wdt_add(NULL);
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xFrequency = pdMS_TO_TICKS(SENSOR_POLL_RATE_MS);
 
   for (;;) {
     esp_task_wdt_reset();
 
     bool urgentMotion = false;
-    if (ulTaskNotifyTake(pdTRUE, 0) > 0) {
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(SENSOR_POLL_RATE_MS)) > 0) {
       urgentMotion = true;
-    }
-
-    if (!urgentMotion) {
-      vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    } else {
-      xLastWakeTime = xTaskGetTickCount();
     }
 
     HealthRecord rec = {};
@@ -432,7 +426,7 @@ void audioTask(void *pvParameters) {
     int      frames_processed               = 0;
     bool     read_error                     = false;
 
-    for (int i = 0; i < 60; i++) {
+    for (int i = 0; i < 187; i++) {
       if (i % 10 == 0) esp_task_wdt_reset();
 
       esp_err_t res = i2s_read(I2S_PORT, raw_buffer, sizeof(raw_buffer),
@@ -522,7 +516,7 @@ void telemetryTask(void *pvParameters) {
     }
     strlcat(af_buf, "]", sizeof(af_buf));
 
-    char payload[896];
+    char payload[768];
     snprintf(payload, sizeof(payload),
       "{"
       "\"id\":\"%s\","
@@ -535,10 +529,7 @@ void telemetryTask(void *pvParameters) {
       "\"gx\":%.4f,\"gy\":%.4f,\"gz\":%.4f,"
       "\"gy_var\":%.4f,"
       "\"jerk\":%.2f,"
-      "\"aud\":%.2f,"
-      "\"state\":%d,"
       "\"mot_int\":%d,"
-      "\"low_act\":%d,"
       "\"err\":%d,"
       "\"v\":0.00,"
       "\"s\":%d,"
@@ -548,10 +539,8 @@ void telemetryTask(void *pvParameters) {
       rec.bodyTemp, rec.envTemp, rec.envHum,
       rec.ax, rec.ay, rec.az,
       rec.gx, rec.gy, rec.gz,
-      rec.gy_variance, rec.activityJerk, rec.audioMagnitude,
-      (int)rec.state,
+      rec.gy_variance, rec.activityJerk,
       rec.motion_interrupt  ? 1 : 0,
-      rec.low_activity_flag ? 1 : 0,
       rec.isError           ? 1 : 0,
       rec.rssi, af_buf
     );
@@ -571,6 +560,13 @@ void setup() {
   Serial.begin(115200);
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, HIGH);
+
+  esp_pm_config_esp32c3_t pm_config = {
+    .max_freq_mhz = 160,
+    .min_freq_mhz = 10,
+    .light_sleep_enable = true
+  };
+  esp_pm_configure(&pm_config);
 
   initDSP();
 
@@ -607,6 +603,8 @@ void setup() {
     mpu.setMotionInterrupt(true);
 
     pinMode(PIN_MPU_INT, INPUT);
+    gpio_wakeup_enable((gpio_num_t)PIN_MPU_INT, GPIO_INTR_HIGH_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
     attachInterrupt(digitalPinToInterrupt(PIN_MPU_INT), mpuInterruptHandler, RISING);
     sensorHealth.mpu_ok = true;
   }
