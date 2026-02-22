@@ -28,7 +28,7 @@
 #define RUMINATION_PITCH_THRESHOLD  0.5f
 #define AUDIO_SAMPLE_RATE           16000
 #define RUMINATION_AUDIO_THRESHOLD  50000.0f
-#define WDT_TIMEOUT_SECONDS         20
+#define WDT_TIMEOUT_SECONDS         30
 #define WIFI_MAX_RETRIES            10
 #define WIFI_RETRY_INTERVAL_MS      500
 #define WIFI_BACKOFF_MS             5000
@@ -40,10 +40,18 @@
 #define MPU_MOTION_THRESHOLD        18
 #define MPU_MOTION_DURATION         2
 
+#define FFT_SIZE     256
+#define NUM_MEL_BINS 8
+
 const char* WIFI_SSID     = "Aditya";
 const char* WIFI_PASSWORD = "aditya@123";
 const int   UDP_PORT      = 4210;
 const char* TARGET_IP     = "255.255.255.255";
+
+IPAddress local_IP(192, 168, 1, 200);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress primaryDNS(8, 8, 8, 8);
 
 struct SensorHealth {
   bool ds18b20_ok  = false;
@@ -54,14 +62,18 @@ struct SensorHealth {
 };
 
 SensorHealth sensorHealth;
-
 char device_id[18];
 
 SemaphoreHandle_t audioMutex;
-float             latestAudioMagnitude = 0.0f;
+float latestAudioMagnitude = 0.0f;
+float latestAudioFeatures[NUM_MEL_BINS] = {0};
 
 volatile bool motionInterruptFired = false;
 static uint32_t seqNum = 0;
+
+int16_t cos_lut[FFT_SIZE / 2];
+int16_t sin_lut[FFT_SIZE / 2];
+int16_t window_lut[FFT_SIZE];
 
 enum BehaviorState {
   RUMINATING,
@@ -84,6 +96,7 @@ struct HealthRecord {
   float         gy_variance;
   float         activityJerk;
   float         audioMagnitude;
+  float         audioFeatures[NUM_MEL_BINS];
   BehaviorState state;
   bool          motion_interrupt;
   bool          low_activity_flag;
@@ -93,6 +106,7 @@ struct HealthRecord {
   bool          mic_ok;
   int           errorCount;
   bool          isError;
+  int           rssi;
 };
 
 QueueHandle_t healthDataQueue;
@@ -106,11 +120,73 @@ Adafruit_AHTX0    aht20;
 Adafruit_MPU6050  mpu;
 WiFiUDP           udp;
 
+void initDSP() {
+  for (int i = 0; i < FFT_SIZE / 2; i++) {
+    cos_lut[i] = (int16_t)(cos(2.0 * PI * i / FFT_SIZE) * 32767.0);
+    sin_lut[i] = (int16_t)(sin(2.0 * PI * i / FFT_SIZE) * 32767.0);
+  }
+  for (int i = 0; i < FFT_SIZE; i++) {
+    window_lut[i] = (int16_t)((0.54 - 0.46 * cos(2.0 * PI * i / (FFT_SIZE - 1))) * 32767.0);
+  }
+}
+
+void int_fft(int16_t *fr, int16_t *fi, int n) {
+  int m = 0;
+  while ((1 << m) < n) m++;
+  int j = 0;
+  for (int i = 0; i < n - 1; i++) {
+    if (i < j) {
+      int16_t tr = fr[j]; int16_t ti = fi[j];
+      fr[j] = fr[i]; fi[j] = fi[i];
+      fr[i] = tr;    fi[i] = ti;
+    }
+    int k = n >> 1;
+    while (k <= j) { j -= k; k >>= 1; }
+    j += k;
+  }
+  for (int l = 1; l <= m; l++) {
+    int le  = 1 << l;
+    int le2 = le >> 1;
+    for (j = 0; j < le2; j++) {
+      int      idx = j << (m - l);
+      int16_t  wr  = cos_lut[idx];
+      int16_t  wi  = -sin_lut[idx];
+      for (int i = j; i < n; i += le) {
+        int ip    = i + le2;
+        int32_t tr = ((int32_t)fr[ip] * wr - (int32_t)fi[ip] * wi) >> 15;
+        int32_t ti = ((int32_t)fr[ip] * wi + (int32_t)fi[ip] * wr) >> 15;
+        fr[ip] = fr[i] - tr;
+        fi[ip] = fi[i] - ti;
+        fr[i] += tr;
+        fi[i] += ti;
+      }
+    }
+  }
+}
+
+uint32_t int_sqrt(uint32_t n) {
+  uint32_t root = 0;
+  uint32_t bit  = 1UL << 30;
+  while (bit > n) bit >>= 2;
+  while (bit != 0) {
+    if (n >= root + bit) {
+      n   -= root + bit;
+      root = (root >> 1) + bit;
+    } else {
+      root >>= 1;
+    }
+    bit >>= 2;
+  }
+  return root;
+}
+
 void IRAM_ATTR mpuInterruptHandler() {
   motionInterruptFired = true;
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
   vTaskNotifyGiveFromISR(TaskSensorHandle, &xHigherPriorityTaskWoken);
-  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+  if (xHigherPriorityTaskWoken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
 }
 
 void indicateBehavior(BehaviorState state) {
@@ -141,7 +217,6 @@ void indicateBehavior(BehaviorState state) {
 
 void sensorTask(void *pvParameters) {
   esp_task_wdt_add(NULL);
-
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = pdMS_TO_TICKS(SENSOR_POLL_RATE_MS);
 
@@ -170,8 +245,8 @@ void sensorTask(void *pvParameters) {
       float bt = ds18b20.getTempCByIndex(0);
       ds18b20.requestTemperatures();
       if (bt == DEVICE_DISCONNECTED_C || bt < -50.0f) {
-        rec.bodyTemp          = 0.0f;
-        rec.isError           = true;
+        rec.bodyTemp            = 0.0f;
+        rec.isError             = true;
         sensorHealth.ds18b20_ok = false;
         sensorHealth.error_count++;
       } else {
@@ -223,7 +298,7 @@ void sensorTask(void *pvParameters) {
       for (int i = 0; i < IMU_SAMPLES_PER_CYCLE; i++) {
         sensors_event_t a, g, mpuTemp;
         if (!mpu.getEvent(&a, &g, &mpuTemp)) {
-          rec.isError        = true;
+          rec.isError         = true;
           sensorHealth.mpu_ok = false;
           sensorHealth.error_count++;
           break;
@@ -248,6 +323,7 @@ void sensorTask(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(IMU_SAMPLE_INTERVAL_MS));
       }
 
+      mpu.setInterruptPinLatch(false);
       mpu.enableSleep(true);
 
       if (validSamples > 0) {
@@ -259,7 +335,7 @@ void sensorTask(void *pvParameters) {
         rec.gz = sumGz / validSamples;
         meanPitch /= validSamples;
 
-        float mean = rec.gy;
+        float mean     = rec.gy;
         float variance = 0.0f;
         for (int i = 0; i < validSamples; i++) {
           float diff = gyroYSamples[i] - mean;
@@ -273,17 +349,23 @@ void sensorTask(void *pvParameters) {
         mpu.setGyroRange(MPU6050_RANGE_500_DEG);
         mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
         mpu.enableSleep(true);
-        mpu.enableMotionDetection(MPU_MOTION_THRESHOLD);
+        mpu.setMotionDetectionThreshold(MPU_MOTION_THRESHOLD);
         mpu.setMotionDetectionDuration(MPU_MOTION_DURATION);
+        mpu.setInterruptPinLatch(false);
+        mpu.setInterruptPinPolarity(true);
+        mpu.setMotionInterrupt(true);
         sensorHealth.mpu_ok = true;
       }
     }
 
-    rec.activityJerk = (validSamples > 1) ? totalJerk / (validSamples - 1) : 0.0f;
+    rec.activityJerk      = (validSamples > 1) ? totalJerk / (validSamples - 1) : 0.0f;
     rec.low_activity_flag = (rec.activityJerk < JERK_MIN && validSamples > 1);
 
     if (urgentMotion) {
       rec.state = ALERT_HIGH_ACTIVITY;
+      if (sensorHealth.mic_ok) {
+        xTaskNotifyGive(TaskAudioHandle);
+      }
     } else if (!sensorHealth.mpu_ok) {
       rec.state = UNKNOWN_STATE;
     } else if (rec.activityJerk > JERK_WALKING * 2.0f) {
@@ -300,8 +382,12 @@ void sensorTask(void *pvParameters) {
     }
 
     xSemaphoreTake(audioMutex, portMAX_DELAY);
-    rec.audioMagnitude   = latestAudioMagnitude;
+    rec.audioMagnitude = latestAudioMagnitude;
+    for (int i = 0; i < NUM_MEL_BINS; i++) {
+      rec.audioFeatures[i] = latestAudioFeatures[i];
+    }
     latestAudioMagnitude = 0.0f;
+    memset(latestAudioFeatures, 0, sizeof(latestAudioFeatures));
     xSemaphoreGive(audioMutex);
 
     if (rec.audioMagnitude > RUMINATION_AUDIO_THRESHOLD) {
@@ -313,6 +399,7 @@ void sensorTask(void *pvParameters) {
     rec.mpu_ok     = sensorHealth.mpu_ok;
     rec.mic_ok     = sensorHealth.mic_ok;
     rec.errorCount = sensorHealth.error_count;
+    rec.rssi       = WiFi.RSSI();
 
     indicateBehavior(rec.state);
 
@@ -325,6 +412,10 @@ void sensorTask(void *pvParameters) {
 void audioTask(void *pvParameters) {
   esp_task_wdt_add(NULL);
 
+  static int32_t raw_buffer[FFT_SIZE];
+  static int16_t fr[FFT_SIZE];
+  static int16_t fi[FFT_SIZE];
+
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
@@ -333,17 +424,18 @@ void audioTask(void *pvParameters) {
     esp_task_wdt_reset();
     i2s_start(I2S_PORT);
 
-    size_t  bytes_read = 0;
-    int32_t raw_buffer[128];
-    i2s_read(I2S_PORT, &raw_buffer, sizeof(raw_buffer), &bytes_read, pdMS_TO_TICKS(100));
+    size_t bytes_read = 0;
+    i2s_read(I2S_PORT, raw_buffer, sizeof(raw_buffer), &bytes_read, pdMS_TO_TICKS(100));
 
-    double   sum_squares   = 0.0;
-    uint32_t total_samples = 0;
-    bool     read_error    = false;
+    uint64_t total_rms_sum                  = 0;
+    uint32_t mel_accumulators[NUM_MEL_BINS] = {0};
+    int      frames_processed               = 0;
+    bool     read_error                     = false;
 
-    for (int i = 0; i < 5; i++) {
-      esp_task_wdt_reset();
-      esp_err_t res = i2s_read(I2S_PORT, &raw_buffer, sizeof(raw_buffer),
+    for (int i = 0; i < 60; i++) {
+      if (i % 10 == 0) esp_task_wdt_reset();
+
+      esp_err_t res = i2s_read(I2S_PORT, raw_buffer, sizeof(raw_buffer),
                                &bytes_read, pdMS_TO_TICKS(200));
       if (res != ESP_OK) {
         read_error          = true;
@@ -352,22 +444,41 @@ void audioTask(void *pvParameters) {
         break;
       }
 
-      int num_samples = bytes_read / sizeof(int32_t);
-      for (int j = 0; j < num_samples; j++) {
-        double val = (double)raw_buffer[j];
-        sum_squares += val * val;
-        total_samples++;
+      memset(fi, 0, sizeof(fi));
+
+      for (int j = 0; j < FFT_SIZE; j++) {
+        int32_t sample = raw_buffer[j] >> 12;
+        fr[j] = (int16_t)((sample * window_lut[j]) >> 15);
+        total_rms_sum += (uint64_t)(sample * sample);
       }
 
+      int_fft(fr, fi, FFT_SIZE);
+
+      int bin_width = (FFT_SIZE / 2) / NUM_MEL_BINS;
+      for (int k = 0; k < FFT_SIZE / 2; k++) {
+        uint32_t mag_sq  = ((uint32_t)(fr[k] * fr[k])) + ((uint32_t)(fi[k] * fi[k]));
+        uint32_t mag     = int_sqrt(mag_sq);
+        int      mel_idx = k / bin_width;
+        if (mel_idx >= NUM_MEL_BINS) mel_idx = NUM_MEL_BINS - 1;
+        mel_accumulators[mel_idx] += mag;
+      }
+
+      frames_processed++;
       vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     i2s_stop(I2S_PORT);
 
-    if (!read_error && total_samples > 0) {
-      float rms = sqrt(sum_squares / total_samples);
+    if (!read_error && frames_processed > 0) {
+      uint32_t final_rms = int_sqrt(
+        (uint32_t)(total_rms_sum / ((uint64_t)frames_processed * FFT_SIZE))
+      );
+
       xSemaphoreTake(audioMutex, portMAX_DELAY);
-      latestAudioMagnitude = rms;
+      latestAudioMagnitude = (float)final_rms;
+      for (int i = 0; i < NUM_MEL_BINS; i++) {
+        latestAudioFeatures[i] = (float)mel_accumulators[i] / frames_processed;
+      }
       xSemaphoreGive(audioMutex);
     }
   }
@@ -385,6 +496,7 @@ void telemetryTask(void *pvParameters) {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
+      WiFi.config(local_IP, gateway, subnet, primaryDNS);
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
       int retries = 0;
@@ -400,7 +512,17 @@ void telemetryTask(void *pvParameters) {
       }
     }
 
-    char payload[700];
+    char af_buf[128] = "[";
+    for (int i = 0; i < NUM_MEL_BINS; i++) {
+      char temp[16];
+      snprintf(temp, sizeof(temp), "%.2f%s",
+               rec.audioFeatures[i],
+               (i == NUM_MEL_BINS - 1) ? "" : ",");
+      strlcat(af_buf, temp, sizeof(af_buf));
+    }
+    strlcat(af_buf, "]", sizeof(af_buf));
+
+    char payload[896];
     snprintf(payload, sizeof(payload),
       "{"
       "\"id\":\"%s\","
@@ -417,33 +539,21 @@ void telemetryTask(void *pvParameters) {
       "\"state\":%d,"
       "\"mot_int\":%d,"
       "\"low_act\":%d,"
-      "\"s_ds18b20\":%d,"
-      "\"s_aht20\":%d,"
-      "\"s_mpu\":%d,"
-      "\"s_mic\":%d,"
-      "\"errcnt\":%d,"
-      "\"err\":%d"
+      "\"err\":%d,"
+      "\"v\":0.00,"
+      "\"s\":%d,"
+      "\"af\":%s"
       "}",
-      device_id,
-      rec.seq,
-      rec.timestamp,
-      rec.bodyTemp,
-      rec.envTemp,
-      rec.envHum,
+      device_id, rec.seq, rec.timestamp,
+      rec.bodyTemp, rec.envTemp, rec.envHum,
       rec.ax, rec.ay, rec.az,
       rec.gx, rec.gy, rec.gz,
-      rec.gy_variance,
-      rec.activityJerk,
-      rec.audioMagnitude,
+      rec.gy_variance, rec.activityJerk, rec.audioMagnitude,
       (int)rec.state,
-      (int)rec.motion_interrupt,
-      (int)rec.low_activity_flag,
-      (int)rec.ds18b20_ok,
-      (int)rec.aht20_ok,
-      (int)rec.mpu_ok,
-      (int)rec.mic_ok,
-      rec.errorCount,
-      (int)rec.isError
+      rec.motion_interrupt  ? 1 : 0,
+      rec.low_activity_flag ? 1 : 0,
+      rec.isError           ? 1 : 0,
+      rec.rssi, af_buf
     );
 
     udp.beginPacket(TARGET_IP, UDP_PORT);
@@ -461,6 +571,8 @@ void setup() {
   Serial.begin(115200);
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, HIGH);
+
+  initDSP();
 
   WiFi.mode(WIFI_STA);
   uint8_t mac[6];
@@ -488,25 +600,29 @@ void setup() {
     mpu.setGyroRange(MPU6050_RANGE_500_DEG);
     mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
     mpu.enableSleep(true);
-    mpu.enableMotionDetection(MPU_MOTION_THRESHOLD);
+    mpu.setMotionDetectionThreshold(MPU_MOTION_THRESHOLD);
     mpu.setMotionDetectionDuration(MPU_MOTION_DURATION);
+    mpu.setInterruptPinLatch(false);
+    mpu.setInterruptPinPolarity(true);
+    mpu.setMotionInterrupt(true);
+
     pinMode(PIN_MPU_INT, INPUT);
     attachInterrupt(digitalPinToInterrupt(PIN_MPU_INT), mpuInterruptHandler, RISING);
     sensorHealth.mpu_ok = true;
   }
 
   i2s_config_t i2s_config = {
-    .mode               = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate        = AUDIO_SAMPLE_RATE,
-    .bits_per_sample    = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format     = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate          = AUDIO_SAMPLE_RATE,
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags   = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count      = 4,
-    .dma_buf_len        = 512,
-    .use_apll           = false,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk         = 0
+    .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count        = 4,
+    .dma_buf_len          = 512,
+    .use_apll             = false,
+    .tx_desc_auto_clear   = false,
+    .fixed_mclk           = 0
   };
 
   i2s_pin_config_t pin_config = {
