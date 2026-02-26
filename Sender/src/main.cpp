@@ -29,16 +29,16 @@
 
 #define IMU_SAMPLES_PER_CYCLE 10
 #define IMU_SAMPLE_INTERVAL_MS 100
-#define JERK_WALKING 100.0f
-#define JERK_GRAZING 40.0f
+#define JERK_WALKING 30.0f
+#define JERK_GRAZING 10.0f
 #define JERK_MIN 0.5f
 
-const char* WIFI_SSID     = "Aditya";
-const char* WIFI_PASSWORD = "aditya@123";
+const char* WIFI_SSID     = "H320";
+const char* WIFI_PASSWORD = "xbvl7713";
 const int   UDP_PORT      = 4210;
 const char* TARGET_IP     = "255.255.255.255";
 
-#define SENSOR_POLL_RATE_MS 10000 
+#define SENSOR_POLL_RATE_MS 30000 
 #define WDT_TIMEOUT_SECONDS 30
 #define DS18B20_RESOLUTION 9 
 
@@ -498,7 +498,7 @@ void setup() {
   }
 
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  mpu.setMotionDetectionThreshold(18);
+  mpu.setMotionDetectionThreshold(10);
   mpu.setMotionDetectionDuration(2);
   mpu.setInterruptPinLatch(false);
   mpu.setInterruptPinPolarity(true);
